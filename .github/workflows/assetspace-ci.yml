@@ -1,0 +1,64 @@
+name: AssetSpace CI (reusable)
+
+# Reusable per-AssetSpace CI for Exocortex Knowledge Architecture program (Phase A, RFC 78c2b7d0 §C2 + de77fe27 VL#17).
+# Runs SHACL-lite schema validation + ontology-imports audit on the calling repo's vault content.
+# Warn-only by default (RR-B staging: warn-only → per-repo-blocking by audit-green).
+# Caller usage:
+#   jobs:
+#     ci:
+#       uses: kitelev/exoas-ci/.github/workflows/assetspace-ci.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      warn_only:
+        description: "Non-blocking mode (true = warn-only pilot, false = blocking)"
+        type: boolean
+        default: true
+      cli_version:
+        description: "@kitelev/exocortex-cli version spec"
+        type: string
+        default: "latest"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout calling repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: SHACL-lite schema validation
+        id: shacl
+        continue-on-error: ${{ inputs.warn_only }}
+        run: |
+          npx -y @kitelev/exocortex-cli@${{ inputs.cli_version }} validate schema \
+            --shapes-mode --vault . --output text | tee shacl-report.txt
+
+      - name: Ontology-imports audit (cross-ontology closure + SCC)
+        id: imports
+        continue-on-error: ${{ inputs.warn_only }}
+        run: |
+          npx -y @kitelev/exocortex-cli@${{ inputs.cli_version }} audit ontology-imports \
+            --vault . --output text | tee imports-report.txt
+
+      - name: CI summary
+        if: always()
+        run: |
+          {
+            echo "## AssetSpace CI — ${{ github.repository }}"
+            echo "Mode: ${{ inputs.warn_only && 'warn-only (non-blocking pilot)' || 'blocking' }}"
+            echo ""
+            echo "### SHACL-lite (validate schema --shapes-mode)  outcome=${{ steps.shacl.outcome }}"
+            echo '```'
+            tail -20 shacl-report.txt 2>/dev/null || echo "(no report)"
+            echo '```'
+            echo "### ontology-imports audit  outcome=${{ steps.imports.outcome }}"
+            echo '```'
+            tail -10 imports-report.txt 2>/dev/null || echo "(no report)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
