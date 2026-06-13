@@ -2,24 +2,34 @@ name: AssetSpace CI (reusable)
 
 # Reusable per-AssetSpace SHACL CI gate for the Exocortex Knowledge Architecture
 # (EKA Alpha 16-repo schema). Canonical home: kitelev/exoas-ci ;
-# .github/workflows/assetspace-ci.yml@main. This file under exocortex/docs/ci/
+# .github/workflows/assetspace-ci.yml@main. The copy under exocortex/docs/ci/
 # is the REVIEWED REFERENCE COPY (issue #3513) — keep it in sync with exoas-ci.
 #
 # What it does, for the calling AssetSpace repo's checked-out content:
 #   1. resolve-deps — resolve the repo's transitive exo__AssetSpace_dependsOn
 #      closure from the central registry (kitelev/exoas-registry), so the
 #      dependent TBox is materialised and cross-repo class references resolve
-#      (issue #3513, builds on #3511). Without this the SHACL gate has no shapes
-#      to apply (false-negative) or demotes every in-scope ref to a warning.
-#   2. validate schema --shapes-mode --vault . --also <each-dep> — SHACL-lite
-#      conformance over the repo + resolved TBox. Genuine sh:Violation fails the
-#      gate (exit 1); unresolvable cross-repo refs are sh:Warning (do NOT fail).
-#   3. audit ontology-imports — cross-ontology closure / SCC check (unchanged).
+#      (issue #3513, builds on #3511).
+#   2. validate schema --shapes-mode --vault <merged> — SHACL-lite conformance
+#      over a SINGLE MERGED vault that contains the calling repo's content +
+#      every resolved dependency, unified under one vault root (one link index,
+#      one graph). Genuine sh:Violation fails the gate (exit 1); unresolvable
+#      cross-repo refs are sh:Warning (do NOT fail).
+#   3. audit ontology-imports — cross-ontology closure / SCC check (advisory).
 #
-# Severity contract (CLI #3488): "zero false-positives from unresolvable
-# cross-repo refs" is achieved by the CLI's severity split — a class ref whose
-# target is absent from the resolved graph is a sh:Warning, never a violation.
-# So a dep that fails to clone DEGRADES to warnings, never to a false red.
+# MERGE vs --also (issue #3523, orchestrator decision 2026-06-14, Option 2):
+# Earlier this gate passed each dependency as a separate `--also <dir>` vault.
+# That produced FALSE sh:class violations: a cross-vault wikilink reference
+# resolves to filename-form IRI (obsidian://vault/<uid>.md) while its subject —
+# parsed in the separate --also vault — is stored under symbolic-form IRI
+# (https://exocortex.my/ontology/<ns>#<local>); the forms don't unify across the
+# --also boundary, so a valid class membership read as a violation. Empirically
+# (CLI 16.92.0): exoas-exocmd = 0 standalone, 30 with `--also`, 0 when deps are
+# merged into ONE vault dir. Fix: assemble a single merged vault (rsync deps +
+# self into one root) and validate it as one graph — the CLI de-dups by subject,
+# so cross-repo class membership resolves correctly. #3523 stays open as the
+# proper CLI-side `--also` IRI-unify fix (fast-follow); this gate no longer
+# depends on it.
 #
 # Caller usage (.github/workflows/ci.yml in an AssetSpace repo):
 #   jobs:
@@ -65,7 +75,7 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Resolve + materialise dependent TBox (registry dependsOn closure)
+      - name: Resolve dependent TBox + assemble single merged validation vault
         id: deps
         if: ${{ inputs.resolve_deps }}
         env:
@@ -77,8 +87,12 @@ jobs:
           GIT_ALLOW_PROTOCOL: "https:ssh"
         run: |
           set -uo pipefail
-          ALSO_FILE="$RUNNER_TEMP/also-args.txt"
-          : > "$ALSO_FILE"
+          MERGED="$RUNNER_TEMP/merged"
+          rm -rf "$MERGED"; mkdir -p "$MERGED"
+          # The calling repo's own content goes into the merged vault first, under
+          # a unique subdir so dep subdirs can never collide with it. All .md
+          # assets end up under one vault root → one link index → one graph.
+          rsync -a --exclude='.git' ./ "$MERGED/_self/"
 
           auth_url() {
             # Inject token into an https URL for private-repo clones; pass through otherwise.
@@ -93,6 +107,7 @@ jobs:
           echo "::group::Clone central registry"
           if ! git clone --depth 1 -- "$(auth_url "${{ inputs.registry_url }}")" "$RUNNER_TEMP/registry" 2>/dev/null; then
             echo "⚠️  Could not clone registry ${{ inputs.registry_url }} — validating standalone (deps unresolved → warnings only)."
+            echo "merged_dir=$MERGED" >> "$GITHUB_OUTPUT"
             echo "::endgroup::"
             exit 0
           fi
@@ -109,15 +124,16 @@ jobs:
           printf '%s\n' "$DEP_URLS"
           echo "::endgroup::"
 
-          echo "::group::Clone dependency repos"
+          echo "::group::Clone + merge dependency repos into the single validation vault"
           i=0
           while IFS= read -r url; do
             [ -z "$url" ] && continue
             name="dep-$i-$(basename "$url" .git)"
             target="$RUNNER_TEMP/deps/$name"
             if git clone --depth 1 -- "$(auth_url "$url")" "$target" 2>/dev/null; then
-              echo "  ✓ $url → $target"
-              printf -- '--also\n%s\n' "$target" >> "$ALSO_FILE"
+              # Merge the dep's content into the single vault under its own subdir.
+              rsync -a --exclude='.git' "$target/" "$MERGED/_dep-$i/"
+              echo "  ✓ $url → merged/_dep-$i ($name)"
             else
               # Best-effort: a dep we can't clone (private, no token) degrades to
               # sh:Warning in validation — never a false violation. Do not fail.
@@ -127,22 +143,25 @@ jobs:
           done <<< "$DEP_URLS"
           echo "::endgroup::"
 
-          echo "also_file=$ALSO_FILE" >> "$GITHUB_OUTPUT"
+          echo "merged_dir=$MERGED" >> "$GITHUB_OUTPUT"
 
-      - name: SHACL-lite schema validation (registry-resolved, blocking unless warn_only)
+      - name: SHACL-lite schema validation (single-graph merged vault, blocking unless warn_only)
         id: shacl
         continue-on-error: ${{ inputs.warn_only }}
         run: |
           set -uo pipefail
-          ALSO_ARGS=()
-          if [ -n "${{ steps.deps.outputs.also_file }}" ] && [ -f "${{ steps.deps.outputs.also_file }}" ]; then
-            while IFS= read -r line; do
-              [ -n "$line" ] && ALSO_ARGS+=("$line")
-            done < "${{ steps.deps.outputs.also_file }}"
+          MERGED="${{ steps.deps.outputs.merged_dir }}"
+          if [ -n "$MERGED" ] && [ -d "$MERGED" ]; then
+            VAULT="$MERGED"
+            echo "Validating MERGED single-graph vault (self + resolved deps unified — avoids the cross-vault --also IRI-form mismatch, #3523)."
+          else
+            # resolve_deps disabled, or registry/deps unavailable → validate the
+            # calling repo standalone (cross-repo refs degrade to warnings).
+            VAULT="."
+            echo "No merged vault available — validating the calling repo standalone."
           fi
-          echo "Validating with ${#ALSO_ARGS[@]} --also token(s) (deps resolved via registry)."
           npx -y @kitelev/exocortex-cli@${{ inputs.cli_version }} validate schema \
-            --shapes-mode --vault . "${ALSO_ARGS[@]}" --output text | tee "$RUNNER_TEMP/shacl-report.txt"
+            --shapes-mode --vault "$VAULT" --output text | tee "$RUNNER_TEMP/shacl-report.txt"
           # Propagate the validate exit code (PIPESTATUS[0]) so violations fail the gate.
           exit "${PIPESTATUS[0]}"
 
@@ -163,7 +182,7 @@ jobs:
           {
             echo "## AssetSpace CI — ${{ github.repository }}"
             echo "Mode: ${{ inputs.warn_only && 'warn-only (non-blocking pilot)' || 'blocking gate' }}"
-            echo "Dependency resolution: ${{ inputs.resolve_deps && 'registry-driven (issue #3513)' || 'disabled (standalone)' }}"
+            echo "Dependency resolution: ${{ inputs.resolve_deps && 'registry-driven single-graph merge (issue #3513 / #3523)' || 'disabled (standalone)' }}"
             echo ""
             echo "### SHACL-lite (validate schema --shapes-mode)  outcome=${{ steps.shacl.outcome }}"
             echo '```'
