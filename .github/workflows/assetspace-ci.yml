@@ -16,6 +16,11 @@ name: AssetSpace CI (reusable)
 #      one graph). Genuine sh:Violation fails the gate (exit 1); unresolvable
 #      cross-repo refs are sh:Warning (do NOT fail).
 #   3. audit ontology-imports — cross-ontology closure / SCC check (advisory).
+#   4. audit ontology-membership — exo__Ontology_admits allow-list conformance
+#      (KSD ArchUnit cohesion ratchet, req c23f6f50): every member of an ontology
+#      declaring exo__Ontology_admits must carry an admitted exo__Instance_class
+#      (subsumption-aware). Fail-open (ontologies without _admits are skipped);
+#      gates like SHACL (exit 1) unless warn_only.
 #
 # MERGE vs --also (issue #3523, orchestrator decision 2026-06-14, Option 2):
 # Earlier this gate passed each dependency as a separate `--also <dir>` vault.
@@ -176,6 +181,32 @@ jobs:
           npx -y @kitelev/exocortex-cli@${{ inputs.cli_version }} audit ontology-imports \
             --vault . --output text | tee "$RUNNER_TEMP/imports-report.txt"
 
+      - name: Ontology-membership audit (exo__Ontology_admits allow-list, blocking unless warn_only)
+        id: membership
+        continue-on-error: ${{ inputs.warn_only }}
+        # Cohesion-side KSD ArchUnit ratchet (req c23f6f50) — the complement of
+        # the coupling-side ontology-imports audit. Every member of an ontology
+        # that DECLARES exo__Ontology_admits must carry an admitted
+        # exo__Instance_class (directly or via a exo__Class_superClass
+        # subsumption walk). FAIL-OPEN: ontologies without _admits are skipped
+        # (audit-first — the ratchet only bites opted-in ontologies), so this is
+        # inert for repos that have not authored allow-lists yet. GATES like the
+        # SHACL step (`exit "${PIPESTATUS[0]}"`) for gate-green (warn_only:false)
+        # repos, advisory for warn-only pilots. Runs on the MERGED single-graph
+        # vault so cross-repo class-defs (concept__Concept, exo__Property, …)
+        # resolve for the superClass walk (mirrors the SHACL step's VAULT logic).
+        run: |
+          set -uo pipefail
+          MERGED="${{ steps.deps.outputs.merged_dir }}"
+          if [ -n "$MERGED" ] && [ -d "$MERGED" ]; then
+            VAULT="$MERGED"
+          else
+            VAULT="."
+          fi
+          npx -y @kitelev/exocortex-cli@${{ inputs.cli_version }} audit ontology-membership \
+            --vault "$VAULT" --output text | tee "$RUNNER_TEMP/membership-report.txt"
+          exit "${PIPESTATUS[0]}"
+
       - name: CI summary
         if: always()
         run: |
@@ -191,5 +222,9 @@ jobs:
             echo "### ontology-imports audit  outcome=${{ steps.imports.outcome }}"
             echo '```'
             tail -10 "$RUNNER_TEMP/imports-report.txt" 2>/dev/null || echo "(no report)"
+            echo '```'
+            echo "### ontology-membership audit  outcome=${{ steps.membership.outcome }}"
+            echo '```'
+            tail -10 "$RUNNER_TEMP/membership-report.txt" 2>/dev/null || echo "(no report)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
