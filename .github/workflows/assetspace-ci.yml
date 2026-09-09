@@ -21,6 +21,13 @@ name: AssetSpace CI (reusable)
 #      declaring exo__Ontology_admits must carry an admitted exo__Instance_class
 #      (subsumption-aware). Fail-open (ontologies without _admits are skipped);
 #      gates like SHACL (exit 1) unless warn_only.
+#   5. command smoke (OPT-IN, `command_smoke: true`) — behavioural check that a
+#      homoiconic command still WRITES what its inheritance rules promise, not
+#      merely that the data validates. Seeds an ems__Task fixture into the merged
+#      vault, runs `apply <command_smoke_cli>` for real (⛔ not --dry-run — that
+#      prints no frontmatter), and asserts the created asset carries
+#      ems__Effort_parent pointing at the fixture, then re-runs SHACL to prove
+#      the write introduced no new violation. Gates like SHACL unless warn_only.
 #
 # MERGE vs --also (issue #3523, orchestrator decision 2026-06-14, Option 2):
 # Earlier this gate passed each dependency as a separate `--also <dir>` vault.
@@ -63,6 +70,25 @@ on:
         description: "@kitelev/exocortex-cli version spec (must include `resolve-deps`, i.e. >= the issue #3513 release)"
         type: string
         default: "latest"
+      command_smoke:
+        description: "Run the opt-in behavioural command smoke (see step 5 in the header). Off by default."
+        type: boolean
+        default: false
+      command_smoke_cli:
+        description: "cliName of the command the smoke applies to an ems__Task fixture"
+        type: string
+        default: "create-action"
+      command_smoke_sources:
+        description: |
+          Extra clone URLs (whitespace/newline separated) merged into the smoke
+          vault ON TOP of the dependsOn closure. Needed when the command's
+          BEHAVIOUR requires a TBox the calling repo does not ontologically
+          depend on — e.g. exoas-exocmd carries the commands but the ems classes
+          live in exoas-public, which depends on exocmd, so declaring the
+          reverse in the registry would make the dependsOn DAG cyclic. This
+          input keeps that runtime-only need out of the ontological graph.
+        type: string
+        default: ""
     secrets:
       registry_token:
         description: "Optional PAT for cloning the registry + PRIVATE dependency repos. Falls back to anonymous (public repos)."
@@ -207,6 +233,114 @@ jobs:
             --vault "$VAULT" --output text | tee "$RUNNER_TEMP/membership-report.txt"
           exit "${PIPESTATUS[0]}"
 
+      - name: Command smoke (opt-in behavioural gate)
+        id: smoke
+        if: ${{ inputs.command_smoke }}
+        continue-on-error: ${{ inputs.warn_only }}
+        env:
+          GH_CLONE_TOKEN: ${{ secrets.registry_token }}
+          GIT_ALLOW_PROTOCOL: "https:ssh"
+          SMOKE_CLI: ${{ inputs.command_smoke_cli }}
+          SMOKE_SOURCES: ${{ inputs.command_smoke_sources }}
+        # Behavioural complement to the SHACL gate: SHACL proves the data is
+        # WELL-FORMED, this proves a command still DOES what its inheritance
+        # rules promise. Runs the real `apply` (⛔ never --dry-run: it prints a
+        # preview, not the written frontmatter) against a copy of the merged
+        # vault, so nothing the smoke writes can reach the repo checkout.
+        run: |
+          set -uo pipefail
+          MERGED="${{ steps.deps.outputs.merged_dir }}"
+          if [ -n "$MERGED" ] && [ -d "$MERGED" ]; then
+            SMOKE="$RUNNER_TEMP/smoke"
+            rm -rf "$SMOKE"; cp -R "$MERGED" "$SMOKE"
+          else
+            SMOKE="$RUNNER_TEMP/smoke"
+            rm -rf "$SMOKE"; mkdir -p "$SMOKE/_self"
+            rsync -a --exclude='.git' ./ "$SMOKE/_self/"
+          fi
+
+          # Extra runtime-only TBox sources (see the command_smoke_sources docs).
+          i=0
+          for url in $SMOKE_SOURCES; do
+            i=$((i + 1))
+            auth="$url"
+            if [ -n "${GH_CLONE_TOKEN:-}" ] && printf '%s' "$url" | grep -q '^https://github.com/'; then
+              auth="https://x-access-token:${GH_CLONE_TOKEN}@github.com/${url#https://github.com/}"
+            fi
+            echo "::group::Clone smoke source $url"
+            if git clone --depth 1 -- "$auth" "$RUNNER_TEMP/smoke-src-$i"; then
+              rsync -a --exclude='.git' "$RUNNER_TEMP/smoke-src-$i/" "$SMOKE/_smoke-src-$i/"
+            else
+              echo "❌ command smoke: could not clone $url — the fixture's TBox would be missing, which makes the smoke vacuous."
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+          # ems__Task fixture. UID-named, class by UID (1b20a8f0 = ems__Task),
+          # status Backlog (753a44d5) so the command's precondition admits it.
+          TASK_UID="$(uuidgen | tr 'A-Z' 'a-z')"
+          cat > "$SMOKE/ci-smoke-task.md" <<FIXTURE
+          ---
+          exo__Asset_uid: $TASK_UID
+          exo__Asset_createdAt: 2026-01-01T00:00:00
+          exo__Instance_class:
+            - "[[1b20a8f0-d745-4e93-91db-4531b3df120e]]"
+          exo__Asset_label: CI command-smoke Task
+          ems__Effort_status: "[[753a44d5-846c-4b82-9196-4fd9a4d48777]]"
+          ---
+
+          Fixture for the AssetSpace CI command smoke. Not part of the repo.
+          FIXTURE
+          sed -i 's/^          //' "$SMOKE/ci-smoke-task.md"
+
+          # Canary: the fixture's class must actually resolve in this vault,
+          # otherwise a green smoke would mean nothing (the rule's condition is
+          # matched by UID and would silently never fire).
+          if ! find "$SMOKE" -name '1b20a8f0-d745-4e93-91db-4531b3df120e.md' | grep -q .; then
+            echo "❌ command smoke: ems__Task class def (1b20a8f0) is not present in the smoke vault."
+            echo "   The dependsOn closure does not carry the ems TBox — add its repo to command_smoke_sources."
+            exit 1
+          fi
+
+          BEFORE="$(find "$SMOKE" -name '*.md' | wc -l | tr -d ' ')"
+          echo "::group::apply $SMOKE_CLI"
+          npx -y @kitelev/exocortex-cli@${{ inputs.cli_version }} apply "$SMOKE_CLI" \
+            "ci-smoke-task.md" --vault "$SMOKE" --input '{"label":"ci-command-smoke"}' --yes \
+            | tee "$RUNNER_TEMP/smoke-apply.txt"
+          rc="${PIPESTATUS[0]}"
+          echo "::endgroup::"
+          if [ "$rc" -ne 0 ]; then
+            echo "❌ command smoke: apply $SMOKE_CLI exited $rc"
+            exit 1
+          fi
+
+          AFTER="$(find "$SMOKE" -name '*.md' | wc -l | tr -d ' ')"
+          if [ "$AFTER" -le "$BEFORE" ]; then
+            echo "❌ command smoke: apply reported success but created no file ($BEFORE → $AFTER)."
+            exit 1
+          fi
+
+          CREATED="$(sed -n 's/.*→ //p' "$RUNNER_TEMP/smoke-apply.txt" | tail -1)"
+          if [ -z "$CREATED" ] || [ ! -f "$SMOKE/$CREATED" ]; then
+            echo "❌ command smoke: could not locate the created asset (parsed: '${CREATED:-<empty>}')."
+            exit 1
+          fi
+          echo "Created: $CREATED"
+          cat "$SMOKE/$CREATED"
+
+          if ! grep -q "ems__Effort_parent:.*$TASK_UID" "$SMOKE/$CREATED"; then
+            echo "❌ command smoke: the created asset has no ems__Effort_parent pointing at the fixture task ($TASK_UID)."
+            echo "   The Task-conditioned inheritance rule is not reaching this command — it was probably unwired."
+            exit 1
+          fi
+          echo "✅ ems__Effort_parent → $TASK_UID"
+
+          # The write must not introduce new violations either.
+          npx -y @kitelev/exocortex-cli@${{ inputs.cli_version }} validate schema \
+            --shapes-mode --vault "$SMOKE" --output text | tee "$RUNNER_TEMP/smoke-shacl.txt"
+          exit "${PIPESTATUS[0]}"
+
       - name: CI summary
         if: always()
         run: |
@@ -227,4 +361,10 @@ jobs:
             echo '```'
             tail -10 "$RUNNER_TEMP/membership-report.txt" 2>/dev/null || echo "(no report)"
             echo '```'
+            if [ "${{ inputs.command_smoke }}" = "true" ]; then
+              echo "### command smoke (${{ inputs.command_smoke_cli }})  outcome=${{ steps.smoke.outcome }}"
+              echo '```'
+              tail -20 "$RUNNER_TEMP/smoke-apply.txt" 2>/dev/null || echo "(no report)"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
