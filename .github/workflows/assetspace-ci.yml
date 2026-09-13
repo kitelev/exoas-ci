@@ -28,6 +28,22 @@ name: AssetSpace CI (reusable)
 #      prints no frontmatter), and asserts the created asset carries
 #      ems__Effort_parent pointing at the fixture, then re-runs SHACL to prove
 #      the write introduced no new violation. Gates like SHACL unless warn_only.
+#   6. audit assetspace-depends --self <owner/repo> — exo__AssetSpace_dependsOn
+#      COVERAGE gate (RFC 306dcb5c, req 04208713): every definition-tier
+#      cross-AssetSpace reference made by THIS repo must have its target inside
+#      the repo's declared dependsOn transitive closure — i.e. inside the very
+#      merged vault step 2 validates. Judged BY CLOSURE (never by the direct
+#      declaration), one-sided, no cycle check on the declared graph (dependsOn
+#      is packaging). A reference that resolves to nothing in the merged vault
+#      counts as uncovered: that is exactly the TBox the SHACL step is missing.
+#      Gates like SHACL unless warn_only (or depends_gate: false).
+#      ⚠ NAMED LIMITATION (not a full gate, by design of the frame): this runs on
+#      the AssetSpace repo's OWN push. It CANNOT catch the DELETION of a
+#      dependsOn declaration — that edit lands in kitelev/exoas-registry, whose
+#      push never triggers this repo's CI; the coverage only re-checks here on
+#      the next push of the dependent repo. The registry-side/scheduled
+#      detector (RFC 306dcb5c N3) is the complement; do not read a green step 6
+#      as "every declaration in the registry is still there".
 #
 # MERGE vs --also (issue #3523, orchestrator decision 2026-06-14, Option 2):
 # Earlier this gate passed each dependency as a separate `--also <dir>` vault.
@@ -70,6 +86,10 @@ on:
         description: "@kitelev/exocortex-cli version spec (must include `resolve-deps`, i.e. >= the issue #3513 release)"
         type: string
         default: "latest"
+      depends_gate:
+        description: "Run step 6 (audit assetspace-depends --self, RFC 306dcb5c / req 04208713) as a BLOCKING gate. false = advisory (reported, never fails). Needs a cli_version that ships the verb; older CLIs skip the step with a notice."
+        type: boolean
+        default: true
       command_smoke:
         description: "Run the opt-in behavioural command smoke (see step 5 in the header). Off by default."
         type: boolean
@@ -124,6 +144,13 @@ jobs:
           # a unique subdir so dep subdirs can never collide with it. All .md
           # assets end up under one vault root → one link index → one graph.
           rsync -a --exclude='.git' ./ "$MERGED/_self/"
+          # Second layout of the SAME content for step 6 (audit assetspace-depends):
+          # the verb keys every asset's AssetSpace by its assetspaces/<owner>/<repo>/
+          # path prefix (req 04208713 §--self), which _self/_dep-N cannot express.
+          # Kept apart from $MERGED so the SHACL/membership steps are byte-identical.
+          DEPVAULT="$RUNNER_TEMP/depends-vault"
+          rm -rf "$DEPVAULT"; mkdir -p "$DEPVAULT/assetspaces/${{ github.repository }}"
+          rsync -a --exclude='.git' ./ "$DEPVAULT/assetspaces/${{ github.repository }}/"
 
           auth_url() {
             # Inject token into an https URL for private-repo clones; pass through otherwise.
@@ -165,6 +192,13 @@ jobs:
               # Merge the dep's content into the single vault under its own subdir.
               rsync -a --exclude='.git' "$target/" "$MERGED/_dep-$i/"
               echo "  ✓ $url → merged/_dep-$i ($name)"
+              # owner/repo from the clone URL (resolve-deps emits https://github.com/<owner>/<repo>[.git]).
+              slug="${url#https://github.com/}"; slug="${slug%.git}"
+              case "$slug" in
+                */*) mkdir -p "$DEPVAULT/assetspaces/$slug"
+                     rsync -a --exclude='.git' "$target/" "$DEPVAULT/assetspaces/$slug/" ;;
+                *)   echo "  ⚠️  $url is not an https://github.com/<owner>/<repo> URL — not laid out for step 6 (its refs will read as unresolved there)" ;;
+              esac
             else
               # Best-effort: a dep we can't clone (private, no token) degrades to
               # sh:Warning in validation — never a false violation. Do not fail.
@@ -175,6 +209,7 @@ jobs:
           echo "::endgroup::"
 
           echo "merged_dir=$MERGED" >> "$GITHUB_OUTPUT"
+          echo "depends_vault=$DEPVAULT" >> "$GITHUB_OUTPUT"
 
       - name: SHACL-lite schema validation (single-graph merged vault, blocking unless warn_only)
         id: shacl
@@ -231,6 +266,40 @@ jobs:
           fi
           npx -y @kitelev/exocortex-cli@${{ inputs.cli_version }} audit ontology-membership \
             --vault "$VAULT" --output text | tee "$RUNNER_TEMP/membership-report.txt"
+          exit "${PIPESTATUS[0]}"
+
+      - name: AssetSpace dependsOn coverage audit (audit assetspace-depends --self, blocking unless warn_only / depends_gate:false)
+        id: depends
+        # Only meaningful over the registry-resolved layout; skipped (not judged)
+        # when resolve_deps is off or the registry could not be cloned.
+        if: ${{ inputs.resolve_deps && steps.deps.outputs.depends_vault != '' }}
+        continue-on-error: ${{ inputs.warn_only || !inputs.depends_gate }}
+        # RFC 306dcb5c coverage gate (req 04208713): judged BY CLOSURE; prints BOTH
+        # numbers (uncovered by closure = verdict, uncovered directly = informational)
+        # with the vault scope label; exit 0 OK / 1 FAIL / 2 BROKEN (degenerate
+        # population — an empty input is never reported clean).
+        #
+        # ⚠ LIMITATION, named on purpose (see header step 6): this catches a MISSING
+        # declaration for a reference THIS repo makes; it cannot catch a declaration
+        # DELETED in kitelev/exoas-registry until this repo pushes again. Do not
+        # read green here as "the registry is intact" — that is N3's job.
+        run: |
+          set -uo pipefail
+          DEPVAULT="${{ steps.deps.outputs.depends_vault }}"
+          CLI="@kitelev/exocortex-cli@${{ inputs.cli_version }}"
+          # Fail-open ONLY on a CLI that predates the verb — and say so loudly, so a
+          # pinned old cli_version cannot be mistaken for a passing gate.
+          if ! npx -y "$CLI" audit --help 2>/dev/null | grep -q 'assetspace-depends'; then
+            echo "⚠️  $CLI has no 'audit assetspace-depends' (needs the req 04208713 release) — step SKIPPED, NOT judged." | tee "$RUNNER_TEMP/depends-report.txt"
+            echo "depends_status=skipped-no-verb" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "depends_status=judged" >> "$GITHUB_OUTPUT"
+          npx -y "$CLI" audit assetspace-depends \
+            --vault "$DEPVAULT" \
+            --registry "$RUNNER_TEMP/registry" \
+            --self "${{ github.repository }}" \
+            --output text 2>&1 | tee "$RUNNER_TEMP/depends-report.txt"
           exit "${PIPESTATUS[0]}"
 
       - name: Command smoke (opt-in behavioural gate)
@@ -360,6 +429,11 @@ jobs:
             echo "### ontology-membership audit  outcome=${{ steps.membership.outcome }}"
             echo '```'
             tail -10 "$RUNNER_TEMP/membership-report.txt" 2>/dev/null || echo "(no report)"
+            echo '```'
+            echo "### assetspace-depends coverage audit (--self ${{ github.repository }})  outcome=${{ steps.depends.outcome }}  status=${{ steps.depends.outputs.depends_status || 'not-run' }}  gate=${{ inputs.depends_gate && 'blocking' || 'advisory' }}"
+            echo "_Catches a MISSING declaration for this repo's references; a declaration DELETED in exoas-registry is only re-checked on this repo's next push (RFC 306dcb5c N3 covers that)._"
+            echo '```'
+            tail -15 "$RUNNER_TEMP/depends-report.txt" 2>/dev/null || echo "(no report)"
             echo '```'
             if [ "${{ inputs.command_smoke }}" = "true" ]; then
               echo "### command smoke (${{ inputs.command_smoke_cli }})  outcome=${{ steps.smoke.outcome }}"
