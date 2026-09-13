@@ -35,7 +35,15 @@ name: AssetSpace CI (reusable)
 #      merged vault step 2 validates. Judged BY CLOSURE (never by the direct
 #      declaration), one-sided, no cycle check on the declared graph (dependsOn
 #      is packaging). A reference that resolves to nothing in the merged vault
-#      counts as uncovered: that is exactly the TBox the SHACL step is missing.
+#      counts as uncovered: that is exactly the TBox the SHACL step is missing —
+#      UNLESS the target belongs to a declared dependsOn that step 1 could NOT
+#      clone (private repo, no usable token): those are passed to the verb via
+#      --missing-deps-file and the verdict DEGRADES explicitly (req 8d432214):
+#      `OK (DEGRADED: declared deps absent from merged vault: …)`, exit 0, with
+#      the blind spot printed (an excused ref may point into an UNDECLARED
+#      absent AssetSpace — coverage is NOT proven for it). References into a
+#      PRESENT but undeclared AssetSpace still FAIL. ⚠ DEGRADED is not proven
+#      coverage: give registry_token to make the merged vault complete.
 #      Gates like SHACL unless warn_only (or depends_gate: false).
 #      ⚠ NAMED LIMITATION (not a full gate, by design of the frame): this runs on
 #      the AssetSpace repo's OWN push. It CANNOT catch the DELETION of a
@@ -83,9 +91,9 @@ on:
         type: string
         default: "https://github.com/kitelev/exoas-registry"
       cli_version:
-        description: "@kitelev/exocortex-cli version spec (must include `resolve-deps`, i.e. >= the issue #3513 release)"
+        description: "@kitelev/exocortex-cli version spec (must include `resolve-deps` (issue #3513) and `audit assetspace-depends --missing-deps-file` (req 8d432214, >= 16.238.0))"
         type: string
-        default: "latest"
+        default: "16.238.0"
       depends_gate:
         description: "Run step 6 (audit assetspace-depends --self, RFC 306dcb5c / req 04208713) as a BLOCKING gate. false = advisory (reported, never fails). Needs a cli_version that ships the verb; older CLIs skip the step with a notice."
         type: boolean
@@ -183,6 +191,12 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Clone + merge dependency repos into the single validation vault"
+          # Declared deps that could NOT be cloned, one resolve-deps URL per line —
+          # the SAME source --self/the closure are keyed from, so step 6 normalises
+          # both sides identically (ownerRepoSlug). Always created (possibly empty)
+          # so step 6 can test `-s` without an existence race.
+          MISSING_DEPS="$RUNNER_TEMP/missing-deps.txt"
+          : > "$MISSING_DEPS"
           i=0
           while IFS= read -r url; do
             [ -z "$url" ] && continue
@@ -200,9 +214,13 @@ jobs:
                 *)   echo "  ⚠️  $url is not an https://github.com/<owner>/<repo> URL — not laid out for step 6 (its refs will read as unresolved there)" ;;
               esac
             else
-              # Best-effort: a dep we can't clone (private, no token) degrades to
-              # sh:Warning in validation — never a false violation. Do not fail.
-              echo "  ⚠️  could not clone $url — skipping (refs into it become warnings)"
+              # Best-effort: a dep we can't clone (private, no token). SHACL: refs
+              # into it degrade to sh:Warning — never a false violation. Step 6:
+              # recorded here and passed as --missing-deps-file, so the coverage
+              # verdict DEGRADES explicitly instead of counting them uncovered
+              # (req 8d432214). Do not fail.
+              printf '%s\n' "$url" >> "$MISSING_DEPS"
+              echo "  ⚠️  could not clone $url — skipping (SHACL: refs into it become warnings; step 6: reported as DEGRADED, not uncovered)"
             fi
             i=$((i+1))
           done <<< "$DEP_URLS"
@@ -210,6 +228,11 @@ jobs:
 
           echo "merged_dir=$MERGED" >> "$GITHUB_OUTPUT"
           echo "depends_vault=$DEPVAULT" >> "$GITHUB_OUTPUT"
+          echo "missing_deps_file=$MISSING_DEPS" >> "$GITHUB_OUTPUT"
+          if [ -s "$MISSING_DEPS" ]; then
+            echo "⚠️  $(wc -l < "$MISSING_DEPS" | tr -d ' ') declared dep(s) NOT materialised — step 6 will judge DEGRADED (coverage not proven for refs into them):"
+            sed 's/^/    /' "$MISSING_DEPS"
+          fi
 
       - name: SHACL-lite schema validation (single-graph merged vault, blocking unless warn_only)
         id: shacl
@@ -294,13 +317,36 @@ jobs:
             echo "depends_status=skipped-no-verb" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "depends_status=judged" >> "$GITHUB_OUTPUT"
+          # Declared deps step 1 could not clone → --missing-deps-file (req 8d432214):
+          # the verb EXCUSES unresolved refs into an explicit DEGRADED verdict and
+          # prints the blind spot; refs into a PRESENT undeclared AssetSpace still
+          # FAIL. A pinned CLI without the flag says so loudly and judges strictly.
+          MISSING="${{ steps.deps.outputs.missing_deps_file }}"
+          # ${ARR[@]+"${ARR[@]}"}: an EMPTY array under `set -u` is "unbound" on
+          # bash < 4.4 — the runner's bash 5 tolerates it, the idiom works on both.
+          MISSING_ARGS=()
+          if [ -n "$MISSING" ] && [ -s "$MISSING" ]; then
+            if npx -y "$CLI" audit assetspace-depends --help 2>/dev/null | grep -q -- '--missing-deps-file'; then
+              MISSING_ARGS=(--missing-deps-file "$MISSING")
+              echo "ℹ️  declared deps NOT materialised (clone failed) — passed as --missing-deps-file (req 8d432214): $(tr '\n' ' ' < "$MISSING")"
+            else
+              echo "⚠️  $CLI has no --missing-deps-file (needs the req 8d432214 release) — the $(wc -l < "$MISSING" | tr -d ' ') un-cloned declared dep(s) will read as UNCOVERED; bump cli_version." | tee "$RUNNER_TEMP/depends-report.txt"
+            fi
+          fi
           npx -y "$CLI" audit assetspace-depends \
             --vault "$DEPVAULT" \
             --registry "$RUNNER_TEMP/registry" \
             --self "${{ github.repository }}" \
-            --output text 2>&1 | tee "$RUNNER_TEMP/depends-report.txt"
-          exit "${PIPESTATUS[0]}"
+            ${MISSING_ARGS[@]+"${MISSING_ARGS[@]}"} \
+            --output text 2>&1 | tee -a "$RUNNER_TEMP/depends-report.txt"
+          rc="${PIPESTATUS[0]}"
+          status=judged
+          if grep -q '^OK (DEGRADED' "$RUNNER_TEMP/depends-report.txt"; then
+            status=judged-degraded
+            echo "::warning title=assetspace-depends DEGRADED::declared dependsOn target(s) absent from the merged vault — coverage NOT proven for refs into them; pass registry_token to make the merged vault complete"
+          fi
+          echo "depends_status=$status" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Command smoke (opt-in behavioural gate)
         id: smoke
@@ -431,7 +477,7 @@ jobs:
             tail -10 "$RUNNER_TEMP/membership-report.txt" 2>/dev/null || echo "(no report)"
             echo '```'
             echo "### assetspace-depends coverage audit (--self ${{ github.repository }})  outcome=${{ steps.depends.outcome }}  status=${{ steps.depends.outputs.depends_status || 'not-run' }}  gate=${{ inputs.depends_gate && 'blocking' || 'advisory' }}"
-            echo "_Catches a MISSING declaration for this repo's references; a declaration DELETED in exoas-registry is only re-checked on this repo's next push (RFC 306dcb5c N3 covers that)._"
+            echo "_Catches a MISSING declaration for this repo's references; a declaration DELETED in exoas-registry is only re-checked on this repo's next push (RFC 306dcb5c N3 covers that). status=judged-degraded = a declared dep was NOT cloned (see step 1) — DEGRADED is not proven coverage (req 8d432214)._"
             echo '```'
             tail -15 "$RUNNER_TEMP/depends-report.txt" 2>/dev/null || echo "(no report)"
             echo '```'
